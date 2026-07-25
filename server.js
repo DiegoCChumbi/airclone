@@ -31,6 +31,24 @@ function sendToParent(message) {
     process.stdout.write(JSON.stringify(message) + '\n');
 }
 
+// Accept commands from the Go parent process via stdin (e.g. generate_qr)
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin, terminal: false });
+rl.on('line', (line) => {
+    try {
+        const cmd = JSON.parse(line.trim());
+        if (cmd.cmd === 'generate_qr' && cmd.url) {
+            qrcode.toString(cmd.url, { type: 'terminal', small: true }, (err, qrString) => {
+                sendToParent({
+                    event: 'server_ready',
+                    url: cmd.url,
+                    qr: qrString || 'Could not generate QR code.'
+                });
+            });
+        }
+    } catch (_) { /* ignore malformed lines */ }
+});
+
 io.on("connection", socket => {
     socket.on("register_player", ({ username }) => {
         if (activeUsernames.has(username)) {

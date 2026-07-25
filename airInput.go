@@ -25,6 +25,10 @@ var (
 	playerStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("#E0E0E0"))
 	cursorStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")) // Bright green for cursor
 	selectedStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFF00")) // Yellow for selected
+
+	hotspotActiveStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#00FF88"))
+	hotspotInactiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#A9A9A9"))
+	warningStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF8C00"))
 )
 
 // --- Model ---
@@ -36,6 +40,7 @@ type Player struct {
 type model struct {
 	qrCode      string
 	url         string
+	originalURL string // URL before hotspot was activated
 	players     []Player
 	cursor      int
 	selected    int // -1 means nothing is selected
@@ -44,12 +49,23 @@ type model struct {
 	udpConn     *net.UDPConn
 	err         error
 	nodeScanner *bufio.Scanner
+	nodeStdin   *bufio.Writer
+	// Hotspot state
+	wifi            wifiInfo
+	hotspotActive   bool
+	hotspotStarting bool
+	hotspotWarning  bool // waiting for user confirmation
+	hotspotErr      string
 }
 
-type qrCodeMsg string
+type qrCodeMsg struct{ qr, url string }
 type playerConnectMsg Player
 type playerDisconnectMsg string
 type errorMsg struct{ err error }
+type wifiStatusMsg wifiInfo
+type hotspotStartedMsg struct{ ip string }
+type hotspotStoppedMsg struct{}
+type hotspotErrMsg struct{ err error }
 
 func initialModel() model {
 	return model{
@@ -60,7 +76,45 @@ func initialModel() model {
 
 // --- Commands & Logic ---
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(m.startSubprocesses(), m.waitForNodeActivity())
+	return tea.Batch(m.startSubprocesses(), m.waitForNodeActivity(), m.detectWifi())
+}
+
+func (m *model) detectWifi() tea.Cmd {
+	return func() tea.Msg { return wifiStatusMsg(getWifiInfo()) }
+}
+
+func (m *model) doStartHotspot() tea.Cmd {
+	return func() tea.Msg {
+		if err := startHotspot(m.wifi.iface); err != nil {
+			return hotspotErrMsg{err}
+		}
+		ip, err := waitForHotspotIP()
+		if err != nil {
+			return hotspotErrMsg{err}
+		}
+		// Open firewall AFTER IP is assigned — ensures the interface
+		// is fully registered with firewalld and zone detection works.
+		openFirewallPort(m.wifi.iface)
+		return hotspotStartedMsg{ip: ip}
+	}
+}
+
+func (m *model) doStopHotspot() tea.Cmd {
+	return func() tea.Msg {
+		stopHotspot()
+		return hotspotStoppedMsg{}
+	}
+}
+
+// sendNodeCmd sends a JSON command to server.js via its stdin.
+func (m *model) sendNodeCmd(v interface{}) {
+	if m.nodeStdin == nil {
+		return
+	}
+	b, _ := json.Marshal(v)
+	m.nodeStdin.Write(b)
+	m.nodeStdin.WriteByte('\n')
+	m.nodeStdin.Flush()
 }
 
 func (m *model) startSubprocesses() tea.Cmd {
@@ -82,8 +136,12 @@ func (m *model) startSubprocesses() tea.Cmd {
 	// Start Node.js
 	m.nodeCmd = exec.Command("node", "server.js")
 	nodePipe, _ := m.nodeCmd.StdoutPipe()
+	nodeInPipe, err := m.nodeCmd.StdinPipe()
+	if err != nil {
+		return func() tea.Msg { return errorMsg{err} }
+	}
+	m.nodeStdin = bufio.NewWriter(nodeInPipe)
 	m.nodeCmd.Stderr = os.Stderr
-	m.nodeCmd.Stdin = nil // Disconnect stdin
 	m.nodeScanner = bufio.NewScanner(nodePipe)
 	if err := m.nodeCmd.Start(); err != nil {
 		return func() tea.Msg { return errorMsg{err} }
@@ -121,8 +179,10 @@ func (m *model) waitForNodeActivity() tea.Cmd {
 
 		switch msgData["event"] {
 		case "server_ready":
-			m.url = msgData["url"].(string)
-			return qrCodeMsg(msgData["qr"].(string))
+			return qrCodeMsg{
+				qr:  msgData["qr"].(string),
+				url: msgData["url"].(string),
+			}
 		case "player_connect":
 			return playerConnectMsg{Username: msgData["username"].(string), ControllerID: int(msgData["controllerId"].(float64))}
 		case "player_disconnect":
@@ -144,8 +204,40 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
-			m.cleanup() // Clean up BEFORE quitting
+			m.cleanup()
 			return m, tea.Quit
+
+		case "h":
+			m.hotspotErr = ""
+			if m.hotspotActive {
+				// Stop the hotspot
+				return m, m.doStopHotspot()
+			}
+			if !m.wifi.available || m.hotspotStarting {
+				break
+			}
+			if m.wifi.connected {
+				// Warn user before cutting their WiFi
+				m.hotspotWarning = true
+			} else {
+				m.hotspotStarting = true
+				return m, m.doStartHotspot()
+			}
+
+		case "y":
+			if m.hotspotWarning {
+				m.hotspotWarning = false
+				m.hotspotStarting = true
+				return m, m.doStartHotspot()
+			}
+
+		case "n", "esc":
+			if m.hotspotWarning {
+				m.hotspotWarning = false
+				break
+			}
+			m.selected = -1
+
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
@@ -158,29 +250,49 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor >= len(m.players) {
 				break
 			}
-			if m.selected == -1 { // Nothing selected, select current
+			if m.selected == -1 {
 				m.selected = m.cursor
-			} else { // One is already selected, perform the SWAP
-				if m.selected == m.cursor { // Deselect
+			} else {
+				if m.selected == m.cursor {
 					m.selected = -1
 				} else {
 					playerA := m.players[m.selected]
 					playerB := m.players[m.cursor]
-
-					// Send command to Python
 					m.sendSwapCommand(playerA.Username, playerB.Username)
-
-					// Update local state
 					m.players[m.selected].ControllerID, m.players[m.cursor].ControllerID = m.players[m.cursor].ControllerID, m.players[m.selected].ControllerID
-					m.selected = -1 // Reset selection
+					m.selected = -1
 				}
 			}
-		case "esc":
-			m.selected = -1 // Cancel selection
 		}
 	case qrCodeMsg:
-		m.qrCode = string(msg)
+		m.qrCode = msg.qr
+		m.url = msg.url
+		if m.originalURL == "" {
+			m.originalURL = msg.url
+		}
 		return m, m.waitForNodeActivity()
+
+	case wifiStatusMsg:
+		m.wifi = wifiInfo(msg)
+
+	case hotspotStartedMsg:
+		m.hotspotStarting = false
+		m.hotspotActive = true
+		newURL := fmt.Sprintf("http://%s:3000", msg.ip)
+		m.sendNodeCmd(map[string]string{"cmd": "generate_qr", "url": newURL})
+
+	case hotspotStoppedMsg:
+		m.hotspotActive = false
+		m.hotspotStarting = false
+		// Restore original QR/URL
+		if m.originalURL != "" {
+			m.sendNodeCmd(map[string]string{"cmd": "generate_qr", "url": m.originalURL})
+		}
+
+	case hotspotErrMsg:
+		m.hotspotStarting = false
+		m.hotspotActive = false
+		m.hotspotErr = msg.err.Error()
 	case playerConnectMsg:
 		m.players = append(m.players, Player(msg))
 		return m, m.waitForNodeActivity()
@@ -227,6 +339,22 @@ func (m *model) View() string {
 		b.WriteString("Generating QR code...\n\n")
 	}
 
+	// --- Hotspot section ---
+	if m.hotspotWarning {
+		b.WriteString(warningStyle.Render("⚠️  Activar el hotspot desconectará tu WiFi actual.") + "\n")
+		b.WriteString(helpStyle.Render("   Presiona 'y' para continuar o 'n' para cancelar.") + "\n\n")
+	} else if m.hotspotStarting {
+		b.WriteString(hotspotInactiveStyle.Render("📡 Iniciando hotspot...") + "\n\n")
+	} else if m.hotspotActive {
+		b.WriteString(hotspotActiveStyle.Render(
+			fmt.Sprintf("📡 [ACTIVO]  Red: %s   Contraseña: %s", hotspotSSID, hotspotPass),
+		) + "\n\n")
+	} else if m.hotspotErr != "" {
+		b.WriteString(warningStyle.Render("❌ Error hotspot: "+m.hotspotErr) + "\n\n")
+	} else if m.wifi.available {
+		b.WriteString(hotspotInactiveStyle.Render("📡 Hotspot inactivo") + "\n\n")
+	}
+
 	b.WriteString(playerListTitleStyle.Render("🎮 Connected Players") + "\n")
 	if len(m.players) == 0 {
 		b.WriteString("No players connected yet.\n")
@@ -247,9 +375,16 @@ func (m *model) View() string {
 		}
 	}
 
-	help := "Use ↑/↓ to navigate. Enter to select. Esc to cancel. 'q' to quit."
-	if m.selected != -1 {
-		help = fmt.Sprintf("Swapping player '%s'. Select another player to swap or Esc to cancel.", m.players[m.selected].Username)
+	var help string
+	switch {
+	case m.hotspotWarning:
+		help = "'y' confirmar  'n' cancelar"
+	case m.selected != -1:
+		help = fmt.Sprintf("Swapping '%s'. Select another to swap or Esc to cancel.", m.players[m.selected].Username)
+	case m.hotspotActive:
+		help = "↑/↓ navegar  Enter seleccionar  'h' apagar hotspot  'q' salir"
+	default:
+		help = "↑/↓ navegar  Enter seleccionar  'h' hotspot  'q' salir"
 	}
 	b.WriteString("\n" + helpStyle.Render(help) + "\n")
 
@@ -257,6 +392,9 @@ func (m *model) View() string {
 }
 
 func (m *model) cleanup() {
+	if m.hotspotActive {
+		stopHotspot()
+	}
 	if m.udpConn != nil {
 		m.udpConn.Close()
 	}
